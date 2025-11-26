@@ -3,105 +3,108 @@ import time
 import requests
 from datetime import datetime, timezone, timedelta
 
-# ==========================================
-# Load environment variables
-# ==========================================
-ORG_ID = os.getenv("IC_ORG_ID")  # MUST be full OrgID, not short code
+ORG_ID = os.getenv("IC_ORG_ID")
 CLIENT_ID = os.getenv("IC_CLIENT_ID")
 CLIENT_SECRET = os.getenv("IC_CLIENT_SECRET")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
-GPS_STALE_MIN = int(os.getenv("GPS_STALE_THRESHOLD_MINUTES", 5))
-REBOOT_COOLDOWN_MIN = int(os.getenv("REBOOT_COOLDOWN_MINUTES", 10))
+GPS_STALE_MIN = int(os.getenv("GPS_STALE_THRESHOLD_MINUTES", 15))
+REBOOT_COOLDOWN_MIN = int(os.getenv("REBOOT_COOLDOWN_MINUTES", 30))
 
-# Load devices dynamically
+# Load all devices
 DEVICES = []
 for i in range(1, 20):
     serial = os.getenv(f"IC_DEVICE{i}_SERIAL")
     name = os.getenv(f"IC_DEVICE{i}_NAME")
     if serial and name:
-        DEVICES.append({"serial": serial.strip(), "name": name.strip()})
+        DEVICES.append({"serial": serial, "name": name})
 
-# Track cooldowns
 last_reboot = {}
+last_status = {}  # For "GPS recovered" alerts
 
-# ==========================================
-# 1. OAUTH TOKEN
-# ==========================================
+
+# -----------------------------------
+# Discord Alert Helper
+# -----------------------------------
+def send_discord(message: str):
+    if not DISCORD_WEBHOOK:
+        return
+    
+    payload = {"content": message}
+    try:
+        requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
+    except Exception:
+        pass
+
+
+# -----------------------------------
+# Access Token
+# -----------------------------------
 def get_access_token():
-    url = "https://api.ic.peplink.com/oauth2/token"
+    token_url = "https://api.ic.peplink.com/oauth2/token"
 
-    payload = {
+    resp = requests.post(token_url, data={
         "grant_type": "client_credentials",
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET
-    }
-
-    resp = requests.post(url, data=payload)
+    })
     resp.raise_for_status()
-
     return resp.json()["access_token"]
 
 
-# ==========================================
-# 2. GET GPS INFO
-# ==========================================
+# -----------------------------------
+# GPS Info
+# -----------------------------------
 def get_gps(serial, token):
-    url = f"https://api.ic.peplink.com/rest/o/{ORG_ID}/d/{serial}/gps_info"
+    url = f"https://api.ic.peplink.com/rest/o/{ORG_ID}/d/{serial}/gps"
     headers = {"Authorization": f"Bearer {token}"}
-
     resp = requests.get(url, headers=headers)
 
     if resp.status_code == 404:
-        return None
+        return None  # Device may not report GPS
 
     resp.raise_for_status()
     return resp.json()
 
 
-# ==========================================
-# 3. SEND REBOOT COMMAND
-# ==========================================
+# -----------------------------------
+# Reboot Device
+# -----------------------------------
 def reboot_device(serial, name, token):
-    url = f"https://api.ic.peplink.com/rest/o/{ORG_ID}/d/{serial}/ctrl/reboot"
+    url = f"https://api.ic.peplink.com/rest/o/{ORG_ID}/d/{serial}/reboot"
     headers = {"Authorization": f"Bearer {token}"}
+    
+    send_discord(f"🚨 **Rebooting {name}** (`{serial}`) — GPS stale too long.")
 
-    print(f"⚠️  Rebooting {name} ({serial})...")
     resp = requests.post(url, headers=headers)
-
-    if resp.status_code not in [200, 202, 204]:
-        print(f"❌ Reboot failed: {resp.text}")
-        resp.raise_for_status()
+    resp.raise_for_status()
 
     last_reboot[serial] = datetime.now(timezone.utc)
-    print("✔️  Reboot command sent.")
 
 
-# ==========================================
-# 4. GPS STALENESS CHECK
-# ==========================================
-def is_gps_stale(gps):
-    if gps is None:
+# -----------------------------------
+# GPS Stale Check
+# -----------------------------------
+def is_gps_stale(gps_obj):
+    if gps_obj is None:
         return True
 
-    ts = gps.get("timestamp")
-    if not ts or ts == "" or ts == "0000-00-00T00:00:00Z":
+    ts = gps_obj.get("timestamp")
+    if not ts:
         return True
 
-    try:
-        gps_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except Exception:
-        return True
+    gps_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    age_minutes = (datetime.now(timezone.utc) - gps_time).total_seconds() / 60
 
-    age = datetime.now(timezone.utc) - gps_time
-    return age.total_seconds() > (GPS_STALE_MIN * 60)
+    return age_minutes > GPS_STALE_MIN
 
 
-# ==========================================
-# 5. MAIN LOOP
-# ==========================================
+# -----------------------------------
+# Main Loop
+# -----------------------------------
 def main():
-    print("🚑 OCEMS GPS Watchdog Started")
-    print(f"Monitoring {len(DEVICES)} devices")
+    send_discord("🚑 **OCEMS GPS Watchdog Started**")
+    print("Watchdog started.")
 
     while True:
         try:
@@ -111,30 +114,34 @@ def main():
                 serial = d["serial"]
                 name = d["name"]
 
-                print(f"\n--- Checking {name} ({serial}) ---")
+                gps_data = get_gps(serial, token)
+                stale = is_gps_stale(gps_data)
 
-                gps = get_gps(serial, token)
-
-                if not is_gps_stale(gps):
-                    print("✔ GPS OK")
+                # ------- GPS OK -------
+                if not stale:
+                    if last_status.get(serial) == "STALE":
+                        send_discord(f"✅ **GPS Restored for {name}** (`{serial}`)")
+                    last_status[serial] = "OK"
                     continue
 
-                print("❗ GPS stale — REBOOT REQUIRED")
+                # ------- GPS STALE -------
+                if last_status.get(serial) != "STALE":
+                    send_discord(f"⚠️ **GPS Stale Detected** on {name} (`{serial}`)")
+                    last_status[serial] = "STALE"
 
+                # cooldown check
                 last = last_reboot.get(serial)
                 if last:
                     if datetime.now(timezone.utc) - last < timedelta(minutes=REBOOT_COOLDOWN_MIN):
-                        print("⏳ Cooldown active — skipping reboot")
+                        send_discord(
+                            f"⏳ **Cooldown active** — Skipping reboot for {name} (`{serial}`)."
+                        )
                         continue
 
                 reboot_device(serial, name, token)
 
         except Exception as e:
-            print(f"🔥 ERROR: {e}")
+            send_discord(f"🔥 **Watchdog Error:** `{e}`")
+            print("ERROR:", e)
 
-        print("\nSleeping 5 minutes...\n")
-        time.sleep(300)
-
-
-if __name__ == "__main__":
-    main()
+        time.sleep(300)  # 5 minutes
